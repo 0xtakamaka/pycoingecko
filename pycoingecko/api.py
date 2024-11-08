@@ -499,3 +499,36 @@ class CoinGeckoAPI:
         api_url = self.__api_url_params(api_url, kwargs)
 
         return self.__request(api_url)
+
+
+    @func_args_preprocessing
+    def get_onchain_top_pools(self, network: str, max_pages: int):
+        url = f'{self.api_base_url}/onchain/networks/{network}/pools'
+        all_pools = {}
+        page = 1
+        while True:
+            params = {
+                "page": page,
+                "sort": "h24_volume_usd_desc",
+            }
+
+            api_url = self.__api_url_params(url, params)
+
+            response = self.__request(api_url)
+
+            pools = response.get("data", [])
+
+            # Break the loop if there are no more pools
+            if not pools:
+                break
+
+            all_pools.update({pool["id"]: pool for pool in pools})
+
+            # Move to the next page
+            page += 1
+
+            # take just first N pages
+            if page >= max_pages:
+                break
+
+        return all_pools
