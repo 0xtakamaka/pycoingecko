@@ -1,5 +1,7 @@
 import json
+import os
 import requests
+import time
 
 from requests.adapters import HTTPAdapter
 from requests.packages.urllib3.util.retry import Retry
@@ -12,12 +14,30 @@ class CoinGeckoAPI:
 
     def __init__(self, api_base_url=__API_URL_BASE, api_key: str = ''):
         self.api_base_url = api_base_url
-        self.api_key = api_key
+        self.api_key = api_key or os.getenv('COINGECKO_PRO_API_KEY', '')
         self.request_timeout = 120
+        self.onchain_page_retries = 2
+        self.onchain_page_retry_delay = 15.0
 
         self.session = requests.Session()
-        retries = Retry(total=5, backoff_factor=0.5, status_forcelist=[502, 503, 504])
-        self.session.mount('http://', HTTPAdapter(max_retries=retries))
+        if self.api_key:
+            self.session.headers.update({'x-cg-pro-api-key': self.api_key})
+        # CoinGecko occasionally returns HTTP 408 while building large on-chain
+        # pool pages. GET requests are safe to retry, including rate limits and
+        # transient upstream failures. Retry-After is honored when supplied.
+        retries = Retry(
+            total=5,
+            connect=5,
+            read=5,
+            status=5,
+            backoff_factor=0.5,
+            status_forcelist=[408, 429, 500, 502, 503, 504],
+            allowed_methods=frozenset(['GET']),
+            respect_retry_after_header=True,
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
 
     def __request(self, url):
         # print(url)
@@ -41,11 +61,17 @@ class CoinGeckoAPI:
 
             raise
 
-    def __api_url_params(self, api_url, params, api_url_has_params=False):
-        # if using pro version of coingecko, inject key in every call
-        if len(self.api_key) > 0:
-            params['x_cg_pro_api_key'] = self.api_key
+    def __request_onchain_page(self, url):
+        """Retry expensive on-chain pages slowly after HTTP retries are exhausted."""
+        for attempt in range(self.onchain_page_retries + 1):
+            try:
+                return self.__request(url)
+            except requests.exceptions.RequestException:
+                if attempt >= self.onchain_page_retries:
+                    raise
+                time.sleep(self.onchain_page_retry_delay * (2 ** attempt))
 
+    def __api_url_params(self, api_url, params, api_url_has_params=False):
         if params:
             # if api_url contains already params and there is already a '?' avoid
             # adding second '?' (api_url += '&' if '?' in api_url else '?'); causes
@@ -532,3 +558,182 @@ class CoinGeckoAPI:
                 break
 
         return all_pools
+
+    def get_onchain_dex_pools(self, network: str, dex: str, max_pages: int = None, max_pools: int = None,
+                              sort: str = 'h24_volume_usd_desc', include: str = 'base_token,quote_token,dex'):
+        """Return paginated pools for one DEX, together with included token metadata.
+
+        ``max_pages`` and ``max_pools`` are optional safety limits. With neither set,
+        pagination continues until CoinGecko returns an empty page.
+        """
+        if not isinstance(network, str) or not network:
+            raise ValueError('network must be a non-empty string')
+        if not isinstance(dex, str) or not dex:
+            raise ValueError('dex must be a non-empty string')
+        if max_pages is not None and (not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages <= 0):
+            raise ValueError('max_pages must be a positive integer or None')
+        if max_pools is not None and (not isinstance(max_pools, int) or isinstance(max_pools, bool) or max_pools <= 0):
+            raise ValueError('max_pools must be a positive integer or None')
+
+        url = f'{self.api_base_url.rstrip("/")}/onchain/networks/{network}/dexes/{dex}/pools'
+        pools = []
+        included = {}
+        seen_pool_ids = set()
+        page = 1
+        pages_fetched = 0
+        complete = False
+        stop_reason = None
+        request_error = None
+        failed_page = None
+
+        while max_pages is None or page <= max_pages:
+            params = {'page': page, 'sort': sort, 'include': include}
+            try:
+                response = self.__request_onchain_page(self.__api_url_params(url, params))
+            except requests.exceptions.RequestException as error:
+                stop_reason = 'request_error'
+                failed_page = page
+                request_error = str(error)
+                break
+            pages_fetched += 1
+            page_pools = response.get('data', [])
+
+            if not page_pools:
+                complete = True
+                stop_reason = 'empty_page'
+                break
+
+            new_pool_count = 0
+            for pool in page_pools:
+                pool_id = pool.get('id')
+                if pool_id in seen_pool_ids:
+                    continue
+                seen_pool_ids.add(pool_id)
+                pools.append(pool)
+                new_pool_count += 1
+                if max_pools is not None and len(pools) >= max_pools:
+                    pools = pools[:max_pools]
+                    stop_reason = 'max_pools'
+                    break
+
+            for item in response.get('included', []):
+                item_id = item.get('id')
+                if item_id:
+                    included[item_id] = item
+
+            if stop_reason == 'max_pools':
+                break
+            if new_pool_count == 0:
+                stop_reason = 'repeated_page'
+                break
+            page += 1
+
+        if stop_reason is None:
+            stop_reason = 'max_pages'
+
+        return {
+            'data': pools,
+            'included': list(included.values()),
+            'meta': {
+                'network': network,
+                'dex': dex,
+                'pages_fetched': pages_fetched,
+                'pool_count': len(pools),
+                'complete': complete,
+                'stop_reason': stop_reason,
+                'failed_page': failed_page,
+                'request_error': request_error,
+            },
+        }
+
+    def get_onchain_network_pools(self, network: str, max_pages: int = None, max_pools: int = None,
+                                  sort: str = 'h24_volume_usd_desc', include: str = 'base_token,quote_token,dex'):
+        """Return paginated pools across a network, using the same result shape as DEX pool discovery."""
+        return self.__get_onchain_pools(network, 'pools', max_pages, max_pools, sort, include)
+
+    def get_onchain_token_pools(self, network: str, address: str, max_pages: int = None,
+                                max_pools: int = None, sort: str = 'h24_volume_usd_desc',
+                                include: str = 'base_token,quote_token,dex'):
+        """Return pools for an exact token address, retaining pagination/error metadata."""
+        if not isinstance(address, str) or not address or any(c in address for c in '/?#'):
+            raise ValueError('address must be a non-empty token address')
+        result = self.__get_onchain_pools(
+            network, f'tokens/{address}/pools', max_pages, max_pools, sort, include)
+        result['meta']['token_address'] = address
+        return result
+
+    def __get_onchain_pools(self, network, resource, max_pages, max_pools, sort, include):
+        if not isinstance(network, str) or not network:
+            raise ValueError('network must be a non-empty string')
+        if max_pages is not None and (not isinstance(max_pages, int) or isinstance(max_pages, bool) or max_pages <= 0):
+            raise ValueError('max_pages must be a positive integer or None')
+        if max_pools is not None and (not isinstance(max_pools, int) or isinstance(max_pools, bool) or max_pools <= 0):
+            raise ValueError('max_pools must be a positive integer or None')
+
+        url = f'{self.api_base_url.rstrip("/")}/onchain/networks/{network}/{resource}'
+        pools = []
+        included = {}
+        seen_pool_ids = set()
+        page = 1
+        pages_fetched = 0
+        complete = False
+        stop_reason = None
+        request_error = None
+        failed_page = None
+
+        while max_pages is None or page <= max_pages:
+            try:
+                response = self.__request_onchain_page(self.__api_url_params(url, {
+                    'page': page, 'sort': sort, 'include': include}))
+            except (requests.exceptions.RequestException, ValueError) as error:
+                stop_reason = 'request_error'
+                failed_page = page
+                request_error = str(error)
+                break
+            pages_fetched += 1
+            page_pools = response.get('data', [])
+            if not page_pools:
+                complete = True
+                stop_reason = 'empty_page'
+                break
+
+            new_pool_count = 0
+            for pool in page_pools:
+                pool_id = pool.get('id')
+                if pool_id in seen_pool_ids:
+                    continue
+                seen_pool_ids.add(pool_id)
+                pools.append(pool)
+                new_pool_count += 1
+                if max_pools is not None and len(pools) >= max_pools:
+                    pools = pools[:max_pools]
+                    stop_reason = 'max_pools'
+                    break
+
+            for item in response.get('included', []):
+                if item.get('id'):
+                    included[item['id']] = item
+
+            if stop_reason == 'max_pools':
+                break
+            if new_pool_count == 0:
+                stop_reason = 'repeated_page'
+                break
+            page += 1
+
+        if stop_reason is None:
+            stop_reason = 'max_pages'
+
+        return {
+            'data': pools,
+            'included': list(included.values()),
+            'meta': {
+                'network': network,
+                'pages_fetched': pages_fetched,
+                'pool_count': len(pools),
+                'complete': complete,
+                'stop_reason': stop_reason,
+                'failed_page': failed_page,
+                'request_error': request_error,
+            },
+        }
